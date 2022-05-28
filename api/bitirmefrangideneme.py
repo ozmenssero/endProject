@@ -1,10 +1,14 @@
 def calculateLesionLength(imageMatrix,lesionParameters):
   import numpy as np
-  from skimage.filters import frangi,threshold_otsu
+  from skimage.filters import frangi,threshold_otsu,median
+  from skimage.feature import corner_harris, corner_peaks
   from skimage import color,io
+  from skimage.morphology import disk,square,closing
   # import matplotlib.pyplot as plt
   import cv2
-
+  import math
+  french=lesionParameters['french']
+  pointCenters=lesionParameters['pointCenters']
   cropCoordinates=lesionParameters['cropCoordinates']
   mouseX,mouseY,lastX,lastY=cropCoordinates['mouseX'],cropCoordinates['mouseY'],cropCoordinates['lastX'],cropCoordinates['lastY']
   lesionLengthInPixel=round(lesionParameters['lesionLength'],5)
@@ -18,22 +22,23 @@ def calculateLesionLength(imageMatrix,lesionParameters):
   #TOPHAT MORPH
   #filterSize =(3, 3)
   #kernel = cv2.getStructuringElement(cv2.MORPH_RECT,filterSize)
-  kernel=np.ones((20,20),np.uint8)
+  kernel=np.ones((30,30),np.uint8)
   tophatImg=cv2.morphologyEx(imgGray,cv2.MORPH_BLACKHAT,kernel)
   # io.imshow(tophatImg,cmap=plt.cm.gray)
 
   #OTSU THRESH ???
   thresh=threshold_otsu(tophatImg)
-  binary= tophatImg <thresh*1.2 #buyuktur kucuk degistir
+  binary= tophatImg <thresh*0.6 #buyuktur kucuk degistir
   binary=binary.astype(float)   #binary image veya float yap burdan
   # io.imshow(binary,cmap=plt.cm.gray)
+
+  #median
+  med = median(binary, square(10))
 
   #FRANGI
   # fig, ax = plt.subplots(ncols=4,figsize=(15,15))
 
-  frangied=frangi(image=imgGray,alpha=2,beta=2,gamma=15)
-  frangiedd=frangi(image=tophatImg,black_ridges=False)
-  frangieddd=frangi(image=binary)
+  frangieddd=frangi(image=med)
 
   # ax[0].imshow(img)
   # ax[0].set_title('Original image')
@@ -53,26 +58,22 @@ def calculateLesionLength(imageMatrix,lesionParameters):
   # plt.show()
 
   thresh=threshold_otsu(frangieddd)
-  sonq= frangieddd <thresh #buyuktur kucuk degistir
+  sonq= frangieddd <thresh*0.4 #buyuktur kucuk degistir
   sonq=sonq.astype(float)   #binary image veya float yap burdan
-  # io.imshow(sonq,cmap=plt.cm.gray)
-  ikinci=frangi(image=sonq,alpha=2,beta=2,gamma=15)
-  # io.imshow(ikinci,cmap=plt.cm.gray)
+
+  med2 = median(sonq, disk(7))
 
   from skimage import util
-  from skimage.morphology import skeletonize,medial_axis,thin #thin'e de bak ise yarayabilir
+  from skimage.morphology import skeletonize
   # cv2_imshow(sonq)
-  intbinar=sonq.astype(float)  #BUNU DEGİSTİR SONUC İCİN
+  intbinar=med2.astype(float)  #BUNU DEGİSTİR SONUC İCİN
   intbinar=np.logical_not(intbinar).astype(float)
 
   # io.imshow(intbinar*255,cmap=plt.cm.gray)
   # intbinar=intbinar*255 # 0 and 1 to 0 and 255
   iskelet=skeletonize(intbinar)
-  medials,misal=medial_axis(intbinar,return_distance=True)
 
-  dist_on_skel=medials*misal
   iskelet=iskelet.astype(np.uint8)
-  medials=(medials).astype(np.uint8)
   # io.imshow(iskelet,cmap=plt.cm.gray)
   # cv2_imshow(sonq*255)
   # cv2_imshow(iskelet*255)
@@ -114,7 +115,7 @@ def calculateLesionLength(imageMatrix,lesionParameters):
   cropped=iskelet[lastY:mouseY,lastX:mouseX]
   labels = label(cropped,connectivity=2) #skimage doc'dan bak
   props=regionprops(labels)
-  propsTable=regionprops_table(labels,properties=('label','area','coords','perimeter','slice'))
+  propsTable=regionprops_table(labels,properties=('label','area','coords','perimeter'))
   propsTable=pd.DataFrame(propsTable) 
   propsTable.sort_values(by='area',ascending=False,inplace=True)
   lesionLabel=propsTable.iloc[0]['label'] #lezyonun olduğu labeli buldum
@@ -125,11 +126,62 @@ def calculateLesionLength(imageMatrix,lesionParameters):
   # io.imshow(labels,cmap=plt.cm.gray)
   # propsTable.head()
 
+  #CORNERLERI BUL
+  cornerHarris=corner_harris(labels)
+  cornerArray=corner_peaks(cornerHarris, min_distance=20, threshold_rel=0.07)
+
+  if(len(cornerArray)):
+    #3 POINT CENTER ILE BRANCH AYRIMI
+    for a,b in cornerArray:#branch olan yerdeki 3x3 neighborlari sil
+      neighbors=[[i,j] for i in range(a-1, a+2) for j in range(b-1, b+2) if i > -1 and j > -1 and j < len(labels[0]) and i < len(labels)]
+      for c,d in neighbors:
+        labels[c][d]=0
+
+    labelhm=label(labels,connectivity=2)
+    props2=regionprops(labelhm)
+    propsTable2=regionprops_table(labelhm,properties=('label','area','coords','slice','perimeter'))
+    propsTable2=pd.DataFrame(propsTable2) 
+    coordsSeries=propsTable2['coords']
+    
+    for i in pointCenters:
+      offsetX=i[0]-lastX
+      offsetY=i[1]-lastY
+      i[0]=offsetY
+      i[1]=offsetX
+
+    approximatedLabels=[]
+    for point in pointCenters:
+      labelAndMinDistance=[0,1000]
+      for index,coordArray in coordsSeries.items(): #.loc index
+        for coord in coordArray: #coord = [row, column]
+          currentDistance=math.sqrt( ((point[0]-coord[0])**2)+((point[1]-coord[1])**2) )
+          if(currentDistance<labelAndMinDistance[1]):
+            labelAndMinDistance[0]=propsTable2.loc[index].label
+            labelAndMinDistance[1]=currentDistance
+      approximatedLabels.append(labelAndMinDistance[0])
+    approximatedLabels=list(set(approximatedLabels))
+
+    if(len(approximatedLabels)):
+        for i in props2: #orientationun yakın olmadıgı labellari yani gereksiz branchleri silme
+          if( i.label not in approximatedLabels ):
+            for j in i.coords:
+              labels[j[0]][j[1]]=0
+
+
+
+
+
+
+
+  #son skeleton
+  sonSkeleton=skeletonize(labels)
+  sonSkeleton=sonSkeleton.astype(np.uint8)
+  #________________________DEVAM
   #UZUNLUK BULMA DENEMESİ
 
-  import math
 
-  coords = np.column_stack(np.where(labels ==1))
+
+  coords = np.column_stack(np.where(sonSkeleton ==1))
   stentLengthInPixel=0.0
   for i in range(len(coords)-1):
     euclideanDist = math.sqrt( ((coords[i][0]-coords[i+1][0])**2)+((coords[i][1]-coords[i+1][1])**2) )
@@ -138,10 +190,16 @@ def calculateLesionLength(imageMatrix,lesionParameters):
     elif(euclideanDist==math.sqrt(2)):
       stentLengthInPixel+=1.41421356
     else:
-      print("cart",i)
       continue
+    
+  if(len(cornerArray)): #neighbor ve cornerleri silindigi icin
+    stentLengthInPixel+=3.0
   # return stentLengthInPixel
-  catheterDiameterInMilimeter=0.2*10
+  if(french=="6"):
+    catheterDiameterInMilimeter=0.2*10
+  elif(french=="7"):
+    catheterDiameterInMilimeter=0.2333*10
+  
   stentLengthInMilimeter=(stentLengthInPixel*catheterDiameterInMilimeter)/lesionLengthInPixel
   return {'stentLengthInMilimeter':round(stentLengthInMilimeter,5),'stentLengthInPixel':round(stentLengthInPixel,5),
   'catheterDiameterInMilimeter':catheterDiameterInMilimeter,'catheterDiameterInPixel':lesionLengthInPixel}
